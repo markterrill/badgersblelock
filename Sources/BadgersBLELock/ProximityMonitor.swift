@@ -28,6 +28,9 @@ protocol ProximityMonitorDelegate: AnyObject {
     func monitorDidUpdateRSSI(_ rssi: Int?, active: Bool)
     /// Called once on each present -> away and away -> present transition.
     func monitorDidUpdatePresence(_ present: Bool, reason: String)
+    /// Called when the lock countdown starts or is called off, so the UI can show
+    /// that a lock is coming before it actually happens.
+    func monitorDidUpdatePending(_ pending: Bool)
     func monitorDidUpdateDeviceList()
 }
 
@@ -35,14 +38,27 @@ final class ProximityMonitor: NSObject {
     // Tunables
     var lockRSSI = -58          // sustained signal weaker than this => away
     var presentRSSI = -50       // signal stronger than this => back
-    var awayDelay = 5.0         // seconds below lockRSSI before declaring away
+    /// Seconds below lockRSSI before declaring away. Changing it cancels any
+    /// countdown already running, so a new value takes effect immediately rather
+    /// than after the old one expires.
+    var awayDelay = 10.0 { didSet { if awayDelay != oldValue { cancelAwayTimer() } } }
     var signalTimeout = 60.0    // seconds with no packet at all before declaring away
     var smoothingWindow = 5
+    /// Coming back has to be sustained, not just glimpsed: this many samples in a
+    /// row above presentRSSI, spanning at least returnDwell seconds. A single
+    /// stray strong packet used to be enough, and since RSSI swings ~15 dB at the
+    /// edge of range, that re-armed the state machine over and over and locked
+    /// the screen once per spike.
+    var returnSamples = 3
+    var returnDwell = 3.0
 
     weak var delegate: ProximityMonitorDelegate?
     private(set) var discovered: [UUID: DiscoveredDevice] = [:]
     private(set) var present = false
     private(set) var smoothedRSSI: Int?
+    /// True while the away countdown is running: the signal is below the lock
+    /// threshold, but it has not been weak for long enough to act on yet.
+    var pendingAway: Bool { awayTimer != nil }
 
     var monitoredUUID: UUID? {
         didSet { restart() }
@@ -56,6 +72,8 @@ final class ProximityMonitor: NSObject {
     private var activeTimer: Timer?
     private var lastReadAt = Date.distantPast
     private var hasSeenDevice = false
+    private var returnStreak = 0
+    private var returnStreakStart: Date?
 
     override init() {
         super.init()
@@ -71,7 +89,9 @@ final class ProximityMonitor: NSObject {
         samples.removeAll()
         smoothedRSSI = nil
         hasSeenDevice = false
+        resetReturnStreak()
         present = true          // assume present until proven otherwise; never lock on launch
+        delegate?.monitorDidUpdatePending(false)
         startScan()
     }
 
@@ -106,11 +126,23 @@ final class ProximityMonitor: NSObject {
         hasSeenDevice = true
         resetSignalTimer()
 
-        // Coming back is judged on the raw sample so it reacts immediately.
-        if !present && rssi >= presentRSSI {
-            present = true
-            samples.removeAll()   // avoid the old weak samples dragging us straight back out
-            delegate?.monitorDidUpdatePresence(true, reason: "close")
+        // Coming back is judged on raw samples so it reacts quickly, but it has
+        // to hold up for a moment first — see returnSamples.
+        if !present {
+            if rssi >= presentRSSI {
+                let start = returnStreakStart ?? Date()
+                returnStreakStart = start
+                returnStreak += 1
+                if returnStreak >= returnSamples,
+                   Date().timeIntervalSince(start) >= returnDwell {
+                    present = true
+                    resetReturnStreak()
+                    samples.removeAll()   // don't let old weak samples drag us straight back out
+                    delegate?.monitorDidUpdatePresence(true, reason: "close")
+                }
+            } else {
+                resetReturnStreak()
+            }
         }
 
         samples.append(rssi)
@@ -121,8 +153,7 @@ final class ProximityMonitor: NSObject {
 
         // Leaving is judged on the smoothed value plus a dwell timer.
         if mean >= lockRSSI {
-            awayTimer?.invalidate()
-            awayTimer = nil
+            cancelAwayTimer()
         } else if present && awayTimer == nil {
             awayTimer = Timer.scheduledTimer(withTimeInterval: awayDelay, repeats: false) { [weak self] _ in
                 guard let self else { return }
@@ -131,12 +162,28 @@ final class ProximityMonitor: NSObject {
                 self.delegate?.monitorDidUpdatePresence(false, reason: "away")
             }
             RunLoop.main.add(awayTimer!, forMode: .common)
+            delegate?.monitorDidUpdatePending(true)
         }
+    }
+
+    private func resetReturnStreak() {
+        returnStreak = 0
+        returnStreakStart = nil
+    }
+
+    private func cancelAwayTimer() {
+        guard awayTimer != nil else { return }
+        awayTimer?.invalidate()
+        awayTimer = nil
+        delegate?.monitorDidUpdatePending(false)
     }
 
     private func resetSignalTimer() {
         signalTimer?.invalidate()
-        signalTimer = Timer.scheduledTimer(withTimeInterval: signalTimeout, repeats: false) { [weak self] _ in
+        // Silence is a stronger signal of absence than a weak reading, but it
+        // still must not lock sooner than the delay you asked for.
+        let timeout = max(signalTimeout, awayDelay)
+        signalTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             guard let self else { return }
             self.smoothedRSSI = nil
             self.delegate?.monitorDidUpdateRSSI(nil, active: false)

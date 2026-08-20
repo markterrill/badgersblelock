@@ -30,7 +30,7 @@ enum NameMatch {
     /// Rough confidence that `deviceName` belongs to the logged-in user.
     /// Scores are only ever compared against each other, never to an absolute bar.
     ///
-    /// "markterrill" vs "Mark's iPhone 14" matches on the token "mark" being a
+    /// "bobsmith" vs "Bob's iPhone 14" matches on the token "bob" being a
     /// substring of the account name, which is the common real-world shape.
     static func score(deviceName: String) -> Int {
         let normalizedIdentities = identities.map(normalize)
@@ -39,18 +39,18 @@ enum NameMatch {
         var score = 0
 
         for token in tokens(deviceName) {
-            // "mark" found inside the account name "markterrill"
+            // "bob" found inside the account name "bobsmith"
             if normalizedIdentities.contains(where: { $0.contains(token) }) {
                 score += token.count * 2
             }
         }
         for token in identityTokens {
-            // "terrill" found inside the device name "Terrill iPhone"
+            // "smith" found inside the device name "Smith iPhone"
             if normalizedDevice.contains(token) {
                 score += token.count * 2
             }
         }
-        // Shared leading characters catch abbreviated names ("mterrill" / "Mark's iPhone")
+        // Shared leading characters catch abbreviated names ("bsmith" / "Bob's iPhone")
         for identity in normalizedIdentities where !identity.isEmpty && !normalizedDevice.isEmpty {
             let shared = zip(identity, normalizedDevice).prefix { $0 == $1 }.count
             if shared >= 3 { score += shared }
