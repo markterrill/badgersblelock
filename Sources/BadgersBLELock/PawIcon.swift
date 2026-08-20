@@ -41,21 +41,29 @@ enum PawIcon {
         }
     }
 
+    /// Fills the paw into `rect` of the current context. Exposed so the app icon
+    /// generator can draw the same geometry in its own colours.
+    static func draw(in rect: NSRect, colour: NSColor, slashed: Bool = false) {
+        let ctx = NSGraphicsContext.current!.cgContext
+        ctx.saveGState()
+        ctx.concatenate(fit(into: rect))
+
+        colour.setFill()
+        pad.fill()
+        for toe in toes {
+            toeShape(toe).fill()
+            claw(toe).fill()
+        }
+        if slashed { strikeThrough(ctx, colour: colour) }
+
+        ctx.restoreGState()
+    }
+
     static func image(for state: State, size: CGFloat = 18) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
-            let ctx = NSGraphicsContext.current!.cgContext
-            ctx.concatenate(fit(into: rect))
-
-            // Resolved inside the handler so the dynamic system colours pick up
-            // the appearance in force at draw time, not at build time.
-            state.tint.setFill()
-            pad.fill()
-            for toe in toes {
-                toeShape(toe).fill()
-                claw(toe).fill()
-            }
-
-            if state == .disabled { strikeThrough(ctx, colour: state.tint) }
+            // Colours are resolved inside the handler so the dynamic system ones
+            // pick up the appearance in force at draw time, not at build time.
+            draw(in: rect, colour: state.tint, slashed: state == .disabled)
             return true
         }
         // Not a template image: templates are recoloured to a flat black or white

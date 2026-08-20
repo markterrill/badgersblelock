@@ -12,6 +12,9 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/BadgersBLELock"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/BadgersBLELock"
+# Committed rather than generated here, so a build needs no extra compilation.
+# Regenerate with ./make-icon.sh when the artwork changes.
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,6 +25,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>       <string>BadgersBLELock</string>
     <key>CFBundleExecutable</key>        <string>BadgersBLELock</string>
     <key>CFBundleIdentifier</key>        <string>local.badgersblelock</string>
+    <key>CFBundleIconFile</key>          <string>AppIcon</string>
+    <key>CFBundleIconName</key>          <string>AppIcon</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key>           <string>1</string>
