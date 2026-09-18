@@ -28,8 +28,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>CFBundleIconName</key>          <string>AppIcon</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key>           <string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.1</string>
+    <key>CFBundleVersion</key>           <string>2</string>
     <key>LSMinimumSystemVersion</key>    <string>12.0</string>
     <!-- Menu-bar only: no Dock icon, no main window. -->
     <key>LSUIElement</key>               <true/>
