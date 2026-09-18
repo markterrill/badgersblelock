@@ -51,11 +51,13 @@ final class ProximityMonitor: NSObject {
     /// samples alone once locked the screen one second after launch, off three
     /// readings taken before the connection had even settled.
     var awaySeconds = 3.0
-    /// Nothing may lock until monitoring has been running this long. The first
-    /// readings after launch are taken while still scanning, before connecting,
-    /// and read far weaker than the truth — and with start-at-login, "just
-    /// launched" means "the user is sitting right here, having just logged in".
-    var warmupSeconds = 20.0
+    /// Nothing may lock until monitoring has been running this long, OR until
+    /// the connection is up, whichever comes first. The first readings after
+    /// launch are taken while still scanning and read far weaker than the
+    /// truth; connecting ends that condition outright, measured at about a
+    /// second. The full wait is only the backstop for when no connection is
+    /// established at all — which, if the phone really is gone, it will not be.
+    var warmupSeconds = 10.0
     /// A recovered signal PAUSES the countdown rather than resetting it, and
     /// only abandons it after this long back above the threshold. Resetting on
     /// every blip meant a long delay could never elapse: RSSI swings ~15 dB, so
@@ -120,6 +122,7 @@ final class ProximityMonitor: NSObject {
     }
 
     private var pastWarmup: Bool {
+        if activeTimer != nil { return true }   // connected: readings are trustworthy
         guard let since = monitoringSince else { return false }
         return Date().timeIntervalSince(since) >= warmupSeconds
     }
@@ -295,7 +298,7 @@ final class ProximityMonitor: NSObject {
                     // nothing" is the hardest failure to diagnose afterwards.
                     ActivityLog.shared.record(.expected, "warmup_hold",
                         "Signal is weak (\(mean) dBm) but monitoring only just started",
-                        action: "Not locking for the first \(Int(warmupSeconds))s after launch",
+                        action: "Not locking until connected, or \(Int(warmupSeconds))s after launch",
                         fields: ["rssi": "\(mean)", "lock_threshold": "\(lockRSSI)"])
                 }
             }
@@ -429,6 +432,14 @@ final class ProximityMonitor: NSObject {
     /// than waiting on whatever advertising packets happen to land.
     private func enterActiveMode(_ peripheral: CBPeripheral) {
         guard activeTimer == nil else { return }
+        // Worth a line of its own: readings before this point come from
+        // advertising packets and run weaker than the truth, which is what the
+        // warm-up exists to sit out. This says how long that actually takes.
+        ActivityLog.shared.record(.ok, "connected",
+            "Connected to the phone, now polling signal directly",
+            action: "Readings every \(pollInterval)s instead of whatever advertising lands",
+            fields: ["seconds_since_first_reading":
+                        monitoringSince.map { String(format: "%.0f", Date().timeIntervalSince($0)) } ?? "0"])
         activeTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
             if Date().timeIntervalSince(self.lastReadAt) > 10 {

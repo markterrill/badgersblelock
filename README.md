@@ -105,10 +105,13 @@ three readings can arrive inside a single second, which once locked the screen
 one second after launch off three readings taken before the connection had
 settled.
 
-For the same reason nothing locks in the **first 20 seconds** after launch. Early
-readings are taken while still scanning, before connecting, and read far weaker
-than the truth; and with Start at Login, "just launched" means the user has just
-sat down. A held-off lock is logged as `warmup_hold` rather than passing in
+For the same reason nothing locks until the app has **connected to the phone, or
+10 seconds have passed**, whichever comes first. Early readings are taken while
+still scanning and read far weaker than the truth; connecting ends that
+condition, measured at about a second on a paired phone, so in normal use the
+warm-up is over almost immediately. The 10 seconds are the backstop for when no
+connection is established at all — which, if the phone really has gone, it will
+not be. A held-off lock is logged as `warmup_hold` rather than passing in
 silence.
 
 Replaying a walk-away trace, the countdown starts about 7 seconds after the
