@@ -37,7 +37,11 @@ protocol ProximityMonitorDelegate: AnyObject {
 final class ProximityMonitor: NSObject {
     // Tunables
     var lockRSSI = -58          // sustained signal weaker than this => away
-    var presentRSSI = -50       // signal stronger than this => back
+    /// How strong the signal must be to count as BACK after the phone has been
+    /// declared away. It deliberately plays no part in the countdown: judging
+    /// weakness by anything but the lock threshold meant a phone at -57, well
+    /// inside a -60 threshold, could count down and lock.
+    var presentRSSI = -50
     /// Seconds below lockRSSI before declaring away. Changing it abandons any
     /// countdown already running, so a new value takes effect immediately rather
     /// than after the old one expires.
@@ -268,21 +272,23 @@ final class ProximityMonitor: NSObject {
                          "packets_per_sec": String(format: "%.1f", packetRate)])
         }
 
-        // Leaving is judged on the smoothed value, accumulated over time, with
-        // hysteresis: the countdown TRIGGERS below lockRSSI but is only released
-        // by a recovery above presentRSSI. Releasing at lockRSSI too meant a
-        // signal hovering a decibel either side of the line flapped between
-        // pause and resume and the countdown never finished — the phone was
-        // plainly away, and the screen still did not lock.
-        if mean >= presentRSSI {
+        // Leaving is judged on the smoothed value, accumulated over time. The
+        // threshold that decides "weak" is the LOCK threshold and nothing else:
+        // counting time spent between the lock and return thresholds as weak
+        // meant a phone sitting at -57, well inside a -60 threshold, could run a
+        // countdown to completion and lock the screen while its owner sat there.
+        //
+        // Flapping around the line is handled by holding rather than resetting:
+        // time above the threshold pauses the countdown and only abandons it
+        // after blipGrace seconds CONTINUOUSLY above. A real departure blips
+        // back for a second or two, not for five unbroken seconds.
+        if mean >= lockRSSI {
             weakStreak = 0
             weakSince = nil
             if awayTimer != nil, strongSince == nil { pauseCountdown(mean: mean) }
         } else {
-            if mean < lockRSSI {
-                weakStreak += 1
-                if weakSince == nil { weakSince = Date() }
-            }
+            weakStreak += 1
+            if weakSince == nil { weakSince = Date() }
             if episode != nil, strongSince != nil { resumeCountdown(mean: mean) }
             if var e = episode {
                 e.weakest = min(e.weakest, mean)
@@ -311,9 +317,9 @@ final class ProximityMonitor: NSObject {
         episode = AwayEpisode(weakest: mean)
         ActivityLog.shared.record(.warn, "countdown_started",
             "Signal weak for \(Int(awaySeconds))s (\(mean) dBm averaged over \(samples.count) readings, lock below \(lockRSSI) dBm)",
-            action: "Started \(Int(awayDelay))s countdown — only a recovery above \(presentRSSI) dBm will stop it",
+            action: "Started \(Int(awayDelay))s countdown — \(Int(blipGrace))s back above \(lockRSSI) dBm will stop it",
             fields: ["rssi": "\(mean)", "lock_threshold": "\(lockRSSI)",
-                     "return_threshold": "\(presentRSSI)", "required": "\(Int(awayDelay))",
+                     "required": "\(Int(awayDelay))",
                      "samples_in_window": "\(samples.count)"])
 
         awayTimer = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { [weak self] _ in
@@ -357,9 +363,9 @@ final class ProximityMonitor: NSObject {
         episode?.pauses += 1
         episode?.currentUnbroken = 0
         ActivityLog.shared.record(.warn, "countdown_paused",
-            "Signal recovered to \(mean) dBm, back above the return threshold \(presentRSSI) dBm",
+            "Signal recovered to \(mean) dBm, back above the lock threshold \(lockRSSI) dBm",
             action: "Countdown held at \(Int(weakAccumulated))s of \(Int(awayDelay))s for up to \(Int(blipGrace))s",
-            fields: ["rssi": "\(mean)", "return_threshold": "\(presentRSSI)",
+            fields: ["rssi": "\(mean)", "lock_threshold": "\(lockRSSI)",
                      "elapsed": "\(Int(weakAccumulated))", "required": "\(Int(awayDelay))",
                      "pauses": "\(episode?.pauses ?? 0)"])
     }
@@ -367,7 +373,7 @@ final class ProximityMonitor: NSObject {
     private func resumeCountdown(mean: Int) {
         strongSince = nil
         ActivityLog.shared.record(.warn, "countdown_resumed",
-            "Signal dropped below the return threshold again (\(mean) dBm)",
+            "Signal dropped below the lock threshold again (\(mean) dBm)",
             action: "Countdown continues from \(Int(weakAccumulated))s of \(Int(awayDelay))s",
             fields: ["rssi": "\(mean)", "elapsed": "\(Int(weakAccumulated))",
                      "required": "\(Int(awayDelay))"])

@@ -70,17 +70,26 @@ that counts as away. A Lock Delay longer than 60 seconds raises that timeout to
 match, so picking 5 minutes does not get undercut by it.
 
 **Return Threshold** (default **5 dB above the lock threshold**) is how strong the
-signal must get to call off a pending lock. It is chosen as an offset because it
-only means anything relative to the lock threshold, and the menu shows the
-resulting absolute value. Choosing 0 makes it identical to the lock threshold,
-which removes the hysteresis: the signal then flaps across a single line and
-countdowns are abandoned constantly. That is the failure it exists to prevent, so
-0 is offered but not advised.
+signal must get for a phone that has been declared *away* to count as back —
+which re-arms monitoring, and resumes it after you unlock with the phone out of
+range. It has no part in the countdown; that is judged on the lock threshold
+alone. It is chosen as an offset because it only means anything relative to the
+lock threshold, and the menu shows the resulting absolute value.
 
-The countdown is *triggered* below the lock threshold and only *released* above
-the return threshold. A signal hovering a decibel either side of the lock line
-therefore keeps counting down rather than flapping — while you walk away the
-phone is plainly gone, even if the odd reading bounces back over the line.
+Choosing 0 makes it identical to the lock threshold, so the phone counts as back
+the instant it crosses the same line that declared it away. A signal resting near
+that line then alternates between away and back. 0 is offered, but a few dB of
+gap is what stops that.
+
+The countdown judges weakness by the **lock threshold and nothing else**. Time
+spent above it is not weak time, whatever the return threshold is set to.
+
+Flapping around that line is handled by holding rather than resetting: a reading
+back above the threshold pauses the countdown, keeping the time already
+accumulated, and only abandons it after five continuous seconds back in range. A
+real departure bounces back over the line for a second or two, not for five
+unbroken seconds, so it still locks — while a phone lying on the desk near the
+line never does.
 
 Readings are smoothed over **4 seconds of time, not a fixed number of samples**.
 While scanning, advertising packets can arrive several times a second, so a
