@@ -162,6 +162,15 @@ is simply absent.
 Registration records a path, so keep the app somewhere stable —
 **/Applications**, not a build directory. Rebuilding in place invalidates it.
 
+## Which version am I running
+
+**About Badgers BLE Lock…** in the menu gives the version and build, and a
+**View Releases** button that opens the releases page — the app does not update
+itself, so that link is how you find out whether a fix has shipped. Installing an
+update means quitting the app, replacing it in Applications, and opening it
+again. The version also appears as `app_version` at the top of Copy Diagnostics,
+which is the more useful place when someone is reporting a problem.
+
 ## Activity log
 
 **Activity Log…** in the menu shows what the app has done: what happened, what it

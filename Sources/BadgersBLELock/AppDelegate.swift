@@ -266,6 +266,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        let about = NSMenuItem(title: "About Badgers BLE Lock…", action: #selector(showAbout),
+                               keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
+
         let activity = NSMenuItem(title: "Activity Log…", action: #selector(showActivity),
                                   keyEquivalent: "")
         activity.target = self
@@ -380,6 +385,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 """
             alert.alertStyle = .warning
             alert.runModal()
+        }
+    }
+
+    /// Where updates come from. In the About box rather than only in the README
+    /// because the README is not what someone has open when they wonder whether
+    /// they are running the version a fix landed in.
+    private static let releasesURL = URL(string: "https://github.com/markterrill/badgersblelock/releases")!
+
+    @objc private func showAbout() {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+
+        let alert = NSAlert()
+        alert.messageText = "Badgers BLE Lock \(short)"
+        // Assembled rather than written as one multi-line literal: a literal's
+        // line continuations keep the source indentation, which arrives in the
+        // dialog as a run of spaces in the middle of a sentence.
+        alert.informativeText = [
+            "Build \(build)",
+            "Locks the screen when your phone walks away, judged by Bluetooth signal strength.",
+            "Updates are published on GitHub. To install one, quit this app, replace it in "
+                + "Applications, and open it again.",
+        ].joined(separator: "\n\n")
+        alert.alertStyle = .informational
+        if let icon = NSImage(named: "AppIcon") { alert.icon = icon }
+        alert.addButton(withTitle: "View Releases")
+        alert.addButton(withTitle: "Close")
+
+        // The menu bar owns the event loop until this is dismissed; without
+        // activating, the alert can open behind whatever is frontmost.
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(Self.releasesURL)
         }
     }
 
