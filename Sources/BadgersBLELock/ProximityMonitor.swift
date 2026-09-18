@@ -38,12 +38,47 @@ final class ProximityMonitor: NSObject {
     // Tunables
     var lockRSSI = -58          // sustained signal weaker than this => away
     var presentRSSI = -50       // signal stronger than this => back
-    /// Seconds below lockRSSI before declaring away. Changing it cancels any
+    /// Seconds below lockRSSI before declaring away. Changing it abandons any
     /// countdown already running, so a new value takes effect immediately rather
     /// than after the old one expires.
-    var awayDelay = 10.0 { didSet { if awayDelay != oldValue { cancelAwayTimer() } } }
+    var awayDelay = 10.0 { didSet { if awayDelay != oldValue { abandonCountdown("delay changed") } } }
+    /// Weak readings in a row before the countdown starts at all. One dip is
+    /// noise, not a departure. This is a floor on the EVIDENCE, not on the time:
+    /// packets can arrive several times a second while scanning, so three of
+    /// them can span a fraction of a second.
+    var awaySamples = 3
+    /// ...which is why weakness must also persist for this long. Counting
+    /// samples alone once locked the screen one second after launch, off three
+    /// readings taken before the connection had even settled.
+    var awaySeconds = 3.0
+    /// Nothing may lock until monitoring has been running this long. The first
+    /// readings after launch are taken while still scanning, before connecting,
+    /// and read far weaker than the truth — and with start-at-login, "just
+    /// launched" means "the user is sitting right here, having just logged in".
+    var warmupSeconds = 20.0
+    /// A recovered signal PAUSES the countdown rather than resetting it, and
+    /// only abandons it after this long back above the threshold. Resetting on
+    /// every blip meant a long delay could never elapse: RSSI swings ~15 dB, so
+    /// the countdown restarted from zero over and over while you walked away.
+    var blipGrace = 5.0
+    /// How often the countdown advances. Also the resolution of its logging.
+    private let tick = 1.0
     var signalTimeout = 60.0    // seconds with no packet at all before declaring away
-    var smoothingWindow = 5
+    /// Smoothing is over a window of TIME, not a count of samples. A 5-sample
+    /// window barely smoothed at all while scanning, where packets can arrive
+    /// several times a second — which is how a phone sitting on the desk could
+    /// read -48 one moment and -61 a few seconds later, and start a countdown.
+    ///
+    /// The length is set by the slower of the two modes. Steady state is the
+    /// connected one, polling RSSI every `pollInterval`, so this window is
+    /// sized to hold about four polls: fewer and one bad reading moves the mean
+    /// too far, more and the lock is needlessly late. Measured on a paired
+    /// iPhone: 0.5 packets/sec at a 2 s poll, hence the poll is 1 s.
+    var smoothingSeconds = 4.0
+    /// How often RSSI is read over an open connection. The connection is
+    /// already up, so this is close to free; it is not worth going below the
+    /// phone's own connection interval, where reads just repeat the last packet.
+    var pollInterval = 1.0
     /// Coming back has to be sustained, not just glimpsed: this many samples in a
     /// row above presentRSSI, spanning at least returnDwell seconds. A single
     /// stray strong packet used to be enough, and since RSSI swings ~15 dB at the
@@ -51,6 +86,12 @@ final class ProximityMonitor: NSObject {
     /// the screen once per spike.
     var returnSamples = 3
     var returnDwell = 3.0
+
+    /// Set around sleep, because the radio goes down before the screen reports
+    /// itself locked and the callback may not be delivered until we wake.
+    var systemSleeping = false
+    /// True when nothing is at risk: the screen is locked, or we are asleep.
+    private var unattended: Bool { Locker.isScreenLocked || systemSleeping }
 
     weak var delegate: ProximityMonitorDelegate?
     private(set) var discovered: [UUID: DiscoveredDevice] = [:]
@@ -66,7 +107,28 @@ final class ProximityMonitor: NSObject {
 
     private var central: CBCentralManager!
     private var monitoredPeripheral: CBPeripheral?
-    private var samples: [Int] = []
+    private var samples: [(rssi: Int, at: Date)] = []
+
+    /// Observed packet arrival rate over the smoothing window. Advertising rate
+    /// is the phone's choice, not ours, so this is measured rather than assumed.
+    /// True once the smoothing window holds a real average rather than a
+    /// cold-start artifact: enough samples, spanning enough of the window.
+    private var windowIsRepresentative: Bool {
+        guard samples.count >= awaySamples,
+              let first = samples.first?.at, let last = samples.last?.at else { return false }
+        return last.timeIntervalSince(first) >= smoothingSeconds * 0.75
+    }
+
+    private var pastWarmup: Bool {
+        guard let since = monitoringSince else { return false }
+        return Date().timeIntervalSince(since) >= warmupSeconds
+    }
+
+    private var packetRate: Double {
+        guard let first = samples.first?.at, let last = samples.last?.at else { return 0 }
+        let span = last.timeIntervalSince(first)
+        return span > 0.5 ? Double(samples.count - 1) / span : 0
+    }
     private var awayTimer: Timer?
     private var signalTimer: Timer?
     private var activeTimer: Timer?
@@ -74,6 +136,29 @@ final class ProximityMonitor: NSObject {
     private var hasSeenDevice = false
     private var returnStreak = 0
     private var returnStreakStart: Date?
+    private var weakStreak = 0
+    /// When the smoothed signal first went below the lock threshold and stayed
+    /// there. Cleared only by a genuine recovery, not by the hysteresis band.
+    private var weakSince: Date?
+    /// When this monitor first heard anything, for the warm-up.
+    private var monitoringSince: Date?
+    /// Time genuinely spent weak. Pauses do not add to it, but do not clear it.
+    private var weakAccumulated: TimeInterval = 0
+    private var strongSince: Date?
+    private var episode: AwayEpisode?
+    private var awayStartedAt: Date?
+    private var lastHeartbeat = Date.distantPast
+
+    /// One departure, from the first weak reading to whatever ended it. Kept so
+    /// that when the phone comes back without a lock having happened, the log
+    /// can say exactly how close it got and what interrupted it.
+    private struct AwayEpisode {
+        let startedAt = Date()
+        var pauses = 0
+        var weakest = 0
+        var longestUnbroken: TimeInterval = 0
+        var currentUnbroken: TimeInterval = 0
+    }
 
     override init() {
         super.init()
@@ -122,7 +207,10 @@ final class ProximityMonitor: NSObject {
 
     // MARK: - Presence state machine
 
-    private func ingest(rssi: Int) {
+    /// Internal rather than private so the countdown can be driven directly by a
+    /// harness — the behaviour it encodes is measured in minutes of walking
+    /// about, which is not something to verify by hand.
+    func ingest(rssi: Int) {
         hasSeenDevice = true
         resetSignalTimer()
 
@@ -138,6 +226,13 @@ final class ProximityMonitor: NSObject {
                     present = true
                     resetReturnStreak()
                     samples.removeAll()   // don't let old weak samples drag us straight back out
+                    let awayFor = awayStartedAt.map { Int(Date().timeIntervalSince($0)) }
+                    ActivityLog.shared.record(.ok, "phone_returned",
+                        "Phone back in range (\(rssi) dBm, needs \(presentRSSI) dBm for \(returnSamples) readings)",
+                        action: "Monitoring re-armed",
+                        fields: ["rssi": "\(rssi)", "return_threshold": "\(presentRSSI)",
+                                 "away_seconds": "\(awayFor ?? 0)"])
+                    awayStartedAt = nil
                     delegate?.monitorDidUpdatePresence(true, reason: "close")
                 }
             } else {
@@ -145,25 +240,160 @@ final class ProximityMonitor: NSObject {
             }
         }
 
-        samples.append(rssi)
-        if samples.count > smoothingWindow { samples.removeFirst() }
-        let mean = Int(samples.reduce(0, +) / samples.count)
+        let now = Date()
+        if monitoringSince == nil { monitoringSince = now }
+        samples.append((rssi, now))
+        samples.removeAll { now.timeIntervalSince($0.at) > smoothingSeconds }
+        // Guard against an unbounded buffer if packets arrive very fast.
+        if samples.count > 120 { samples.removeFirst(samples.count - 120) }
+        let mean = samples.map(\.rssi).reduce(0, +) / samples.count
         smoothedRSSI = mean
         delegate?.monitorDidUpdateRSSI(mean, active: activeTimer != nil)
 
-        // Leaving is judged on the smoothed value plus a dwell timer.
-        if mean >= lockRSSI {
-            cancelAwayTimer()
-        } else if present && awayTimer == nil {
-            awayTimer = Timer.scheduledTimer(withTimeInterval: awayDelay, repeats: false) { [weak self] _ in
-                guard let self else { return }
-                self.present = false
-                self.awayTimer = nil
-                self.delegate?.monitorDidUpdatePresence(false, reason: "away")
-            }
-            RunLoop.main.add(awayTimer!, forMode: .common)
-            delegate?.monitorDidUpdatePending(true)
+        // A periodic trace, so a stretch with no transitions is still
+        // reconstructable. Throttled hard: ingest runs several times a second.
+        if Date().timeIntervalSince(lastHeartbeat) >= 60 {
+            lastHeartbeat = Date()
+            ActivityLog.shared.record(.ok, "signal",
+                "Signal \(mean) dBm (lock below \(lockRSSI), return above \(presentRSSI))",
+                action: present ? "Phone present, nothing to do" : "Phone away",
+                fields: ["rssi": "\(mean)", "threshold": "\(lockRSSI)",
+                         "present": "\(present)", "mode": activeTimer != nil ? "connected" : "scanning",
+                         // How much evidence the smoothed value rests on. If this
+                         // is ~1 the window is barely averaging anything.
+                         "samples_in_window": "\(samples.count)",
+                         "packets_per_sec": String(format: "%.1f", packetRate)])
         }
+
+        // Leaving is judged on the smoothed value, accumulated over time, with
+        // hysteresis: the countdown TRIGGERS below lockRSSI but is only released
+        // by a recovery above presentRSSI. Releasing at lockRSSI too meant a
+        // signal hovering a decibel either side of the line flapped between
+        // pause and resume and the countdown never finished — the phone was
+        // plainly away, and the screen still did not lock.
+        if mean >= presentRSSI {
+            weakStreak = 0
+            weakSince = nil
+            if awayTimer != nil, strongSince == nil { pauseCountdown(mean: mean) }
+        } else {
+            if mean < lockRSSI {
+                weakStreak += 1
+                if weakSince == nil { weakSince = Date() }
+            }
+            if episode != nil, strongSince != nil { resumeCountdown(mean: mean) }
+            if var e = episode {
+                e.weakest = min(e.weakest, mean)
+                episode = e
+            }
+            if present, awayTimer == nil, let since = weakSince,
+               Date().timeIntervalSince(since) >= awaySeconds,
+               weakStreak >= awaySamples, windowIsRepresentative {
+                if pastWarmup {
+                    startCountdown(mean: mean)
+                } else {
+                    // Logged rather than silent: "it did not lock and said
+                    // nothing" is the hardest failure to diagnose afterwards.
+                    ActivityLog.shared.record(.expected, "warmup_hold",
+                        "Signal is weak (\(mean) dBm) but monitoring only just started",
+                        action: "Not locking for the first \(Int(warmupSeconds))s after launch",
+                        fields: ["rssi": "\(mean)", "lock_threshold": "\(lockRSSI)"])
+                }
+            }
+        }
+    }
+
+    private func startCountdown(mean: Int) {
+        weakAccumulated = 0
+        strongSince = nil
+        episode = AwayEpisode(weakest: mean)
+        ActivityLog.shared.record(.warn, "countdown_started",
+            "Signal weak for \(Int(awaySeconds))s (\(mean) dBm averaged over \(samples.count) readings, lock below \(lockRSSI) dBm)",
+            action: "Started \(Int(awayDelay))s countdown — only a recovery above \(presentRSSI) dBm will stop it",
+            fields: ["rssi": "\(mean)", "lock_threshold": "\(lockRSSI)",
+                     "return_threshold": "\(presentRSSI)", "required": "\(Int(awayDelay))",
+                     "samples_in_window": "\(samples.count)"])
+
+        awayTimer = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { [weak self] _ in
+            self?.advanceCountdown()
+        }
+        RunLoop.main.add(awayTimer!, forMode: .common)
+        delegate?.monitorDidUpdatePending(true)
+    }
+
+    private func advanceCountdown() {
+        if let since = strongSince {
+            // Paused. Held, not reset — but not forever.
+            if Date().timeIntervalSince(since) >= blipGrace {
+                abandonCountdown("signal recovered for \(Int(blipGrace))s")
+            }
+            return
+        }
+
+        weakAccumulated += tick
+        if var e = episode {
+            e.currentUnbroken += tick
+            e.longestUnbroken = max(e.longestUnbroken, e.currentUnbroken)
+            episode = e
+        }
+
+        guard weakAccumulated >= awayDelay else { return }
+        let held = weakAccumulated
+        let pauses = episode?.pauses ?? 0
+        stopCountdown()
+        present = false
+        awayStartedAt = Date()
+        ActivityLog.shared.record(.ok, "countdown_complete",
+            "Signal stayed weak for the full \(Int(awayDelay))s",
+            action: "Declaring phone away",
+            fields: ["elapsed": "\(Int(held))", "required": "\(Int(awayDelay))", "pauses": "\(pauses)"])
+        delegate?.monitorDidUpdatePresence(false, reason: "away")
+    }
+
+    private func pauseCountdown(mean: Int) {
+        strongSince = Date()
+        episode?.pauses += 1
+        episode?.currentUnbroken = 0
+        ActivityLog.shared.record(.warn, "countdown_paused",
+            "Signal recovered to \(mean) dBm, back above the return threshold \(presentRSSI) dBm",
+            action: "Countdown held at \(Int(weakAccumulated))s of \(Int(awayDelay))s for up to \(Int(blipGrace))s",
+            fields: ["rssi": "\(mean)", "return_threshold": "\(presentRSSI)",
+                     "elapsed": "\(Int(weakAccumulated))", "required": "\(Int(awayDelay))",
+                     "pauses": "\(episode?.pauses ?? 0)"])
+    }
+
+    private func resumeCountdown(mean: Int) {
+        strongSince = nil
+        ActivityLog.shared.record(.warn, "countdown_resumed",
+            "Signal dropped below the return threshold again (\(mean) dBm)",
+            action: "Countdown continues from \(Int(weakAccumulated))s of \(Int(awayDelay))s",
+            fields: ["rssi": "\(mean)", "elapsed": "\(Int(weakAccumulated))",
+                     "required": "\(Int(awayDelay))"])
+    }
+
+    /// Ends a countdown without locking, and says why — the question the log
+    /// exists to answer.
+    private func abandonCountdown(_ why: String) {
+        guard awayTimer != nil else { return }
+        let held = weakAccumulated
+        let e = episode
+        stopCountdown()
+        ActivityLog.shared.record(.warn, "countdown_abandoned",
+            "Countdown abandoned: \(why)",
+            action: "No lock — reached \(Int(held))s of the \(Int(awayDelay))s required",
+            fields: ["elapsed": "\(Int(held))", "required": "\(Int(awayDelay))",
+                     "pauses": "\(e?.pauses ?? 0)",
+                     "longest_unbroken": "\(Int(e?.longestUnbroken ?? 0))",
+                     "weakest_rssi": "\(e?.weakest ?? 0)"])
+        delegate?.monitorDidUpdatePending(false)
+    }
+
+    private func stopCountdown() {
+        awayTimer?.invalidate()
+        awayTimer = nil
+        weakAccumulated = 0
+        strongSince = nil
+        weakStreak = 0
+        weakSince = nil
     }
 
     private func resetReturnStreak() {
@@ -171,12 +401,7 @@ final class ProximityMonitor: NSObject {
         returnStreakStart = nil
     }
 
-    private func cancelAwayTimer() {
-        guard awayTimer != nil else { return }
-        awayTimer?.invalidate()
-        awayTimer = nil
-        delegate?.monitorDidUpdatePending(false)
-    }
+
 
     private func resetSignalTimer() {
         signalTimer?.invalidate()
@@ -187,8 +412,13 @@ final class ProximityMonitor: NSObject {
             guard let self else { return }
             self.smoothedRSSI = nil
             self.delegate?.monitorDidUpdateRSSI(nil, active: false)
+            ActivityLog.shared.record(.warn, "signal_lost",
+                "No Bluetooth packets from the phone for \(Int(timeout))s",
+                action: self.present ? "Treating as away" : "Already away, no change",
+                fields: ["timeout": "\(Int(timeout))", "was_present": "\(self.present)"])
             if self.present {
                 self.present = false
+                self.awayStartedAt = Date()
                 self.delegate?.monitorDidUpdatePresence(false, reason: "lost")
             }
         }
@@ -199,7 +429,7 @@ final class ProximityMonitor: NSObject {
     /// than waiting on whatever advertising packets happen to land.
     private func enterActiveMode(_ peripheral: CBPeripheral) {
         guard activeTimer == nil else { return }
-        activeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        activeTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
             if Date().timeIntervalSince(self.lastReadAt) > 10 {
                 self.central.cancelPeripheralConnection(peripheral)
@@ -217,7 +447,42 @@ final class ProximityMonitor: NSObject {
 
 extension ProximityMonitor: CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if central.state == .poweredOn { startScan() }
+        // Every state but poweredOn used to be silent, which meant a denied
+        // permission or a switched-off radio looked exactly like "nothing is
+        // happening" — the single most confusing way for this app to fail.
+        switch central.state {
+        case .poweredOn:
+            ActivityLog.shared.record(unattended ? .expected : .ok, "bluetooth_ready",
+                                      "Bluetooth powered on",
+                                      action: "Scanning for the phone")
+            startScan()
+        case .unauthorized:
+            ActivityLog.shared.record(.fail, "bluetooth_unauthorized",
+                "Bluetooth permission has not been granted to this app",
+                action: "Cannot measure distance — nothing will ever lock",
+                fields: ["fix": "System Settings > Privacy & Security > Bluetooth"])
+        case .poweredOff:
+            // macOS powers the radio down when the machine sleeps, which is
+            // most of the times this fires — and the screen is already locked
+            // then, so nothing is at risk. Only call it a failure when the
+            // screen is up, where it means the user switched Bluetooth off.
+            if unattended {
+                ActivityLog.shared.record(.expected, "bluetooth_off",
+                    "Bluetooth switched off while the Mac was asleep or locked",
+                    action: "Monitoring paused until it wakes")
+            } else {
+                ActivityLog.shared.record(.fail, "bluetooth_off", "Bluetooth is switched off",
+                                          action: "Cannot measure distance — nothing will lock")
+            }
+        case .unsupported:
+            ActivityLog.shared.record(.fail, "bluetooth_unsupported",
+                                      "This Mac reports no Bluetooth LE support",
+                                      action: "Monitoring cannot run")
+        default:
+            ActivityLog.shared.record(.warn, "bluetooth_state",
+                                      "Bluetooth state \(central.state.rawValue)",
+                                      action: "Waiting")
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,

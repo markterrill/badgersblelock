@@ -56,11 +56,64 @@ count as away.
 **Lock Delay** (default **10 seconds**) is how long it has to stay that weak
 before the screen actually locks — 4 seconds through to 5 minutes. The paw turns
 red as soon as the countdown starts, so a long delay is still visible rather than
-silent. Changing the delay cancels any countdown already running.
+silent. Changing the delay abandons any countdown already running.
+
+The countdown starts only after three weak readings in a row, and it accumulates
+time rather than running a single timer. A signal that recovers **pauses** it for
+up to 5 seconds and then abandons it; it does not reset it. This matters: RSSI
+swings about 15 dB, so the previous behaviour of resetting on every blip meant a
+long delay could never elapse while you walked away, and the screen simply never
+locked.
 
 The no-signal timeout is 60 seconds: if the phone stops advertising altogether,
 that counts as away. A Lock Delay longer than 60 seconds raises that timeout to
 match, so picking 5 minutes does not get undercut by it.
+
+**Return Threshold** (default **5 dB above the lock threshold**) is how strong the
+signal must get to call off a pending lock. It is chosen as an offset because it
+only means anything relative to the lock threshold, and the menu shows the
+resulting absolute value. Choosing 0 makes it identical to the lock threshold,
+which removes the hysteresis: the signal then flaps across a single line and
+countdowns are abandoned constantly. That is the failure it exists to prevent, so
+0 is offered but not advised.
+
+The countdown is *triggered* below the lock threshold and only *released* above
+the return threshold. A signal hovering a decibel either side of the lock line
+therefore keeps counting down rather than flapping — while you walk away the
+phone is plainly gone, even if the odd reading bounces back over the line.
+
+Readings are smoothed over **4 seconds of time, not a fixed number of samples**.
+While scanning, advertising packets can arrive several times a second, so a
+5-sample window covered under a second and barely smoothed at all — which is how
+a phone on the desk could read -48 one moment and -61 the next and start a
+countdown.
+
+The window is sized from the measured sample rate. Once the app has connected to
+the phone it polls RSSI directly, so the rate is whatever the poll interval is
+rather than the phone's advertising rate: at the original 2-second poll a
+4-second window held only two readings. The poll is therefore **1 second**, which
+gives the window about four readings — enough that one bad value cannot move the
+mean far, without making the lock late. Each heartbeat line in the activity log
+carries `samples_in_window` and `packets_per_sec` so this can be checked rather
+than assumed.
+
+Before any countdown starts, three conditions must all hold: the smoothed signal
+has been below the lock threshold for **3 continuous seconds**, there are at
+least three readings behind that average, and the window spans enough time to be
+a real average. The duration matters as much as the count — while scanning,
+three readings can arrive inside a single second, which once locked the screen
+one second after launch off three readings taken before the connection had
+settled.
+
+For the same reason nothing locks in the **first 20 seconds** after launch. Early
+readings are taken while still scanning, before connecting, and read far weaker
+than the truth; and with Start at Login, "just launched" means the user has just
+sat down. A held-off lock is logged as `warmup_hold` rather than passing in
+silence.
+
+Replaying a walk-away trace, the countdown starts about 7 seconds after the
+signal genuinely crosses the threshold, so a 10-second delay locks roughly 17
+seconds after you leave.
 
 RSSI does not map cleanly to metres — your body, walls, and pocket position
 swing it by 15 dB. Calibrate by walking to where you want it to lock and reading
@@ -96,6 +149,43 @@ is simply absent.
 
 Registration records a path, so keep the app somewhere stable —
 **/Applications**, not a build directory. Rebuilding in place invalidates it.
+
+## Activity log
+
+**Activity Log…** in the menu shows what the app has done: what happened, what it
+did about it, and a traffic light — green normal, amber something delayed the
+lock, red the lock did not happen, grey routine and not a fault (the radio going
+down as the Mac sleeps, or a lock held off during the warm-up).
+
+**Copy Diagnostics** puts the settings, the machine's capabilities and the recent
+history on the clipboard in one go, which is the thing to paste when asking why a
+lock did not fire.
+
+The same lines are appended to `~/Library/Logs/BadgersBLELock/activity.log`, in a
+format meant to be read by someone — or something — that has never seen this
+source:
+
+```
+<iso8601> [LEVEL] <event> | <description> | <action> | <key=value ...>
+```
+
+Each session starts with a header of every setting that decides later lines, so
+the file can be interpreted on its own. A run of identical events collapses to
+its first and last line, the last carrying `(repeated N times over the last X
+minutes)` — otherwise the 60-second heartbeat buries everything that matters.
+
+At launch the file is trimmed to the **last 3 days**, by whole sessions: a
+session is only intelligible alongside the header listing the settings that
+produced it, and one that began four days ago but is still running is current
+rather than stale.
+
+Events are also mirrored to `os.Logger` under the subsystem
+`local.badgersblelock`. Note that `log` is a zsh builtin, so the absolute path is
+required:
+
+```
+/usr/bin/log show --predicate 'subsystem == "local.badgersblelock"' --last 1h
+```
 
 ## How the lock happens
 

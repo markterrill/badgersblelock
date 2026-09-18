@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let prefs = UserDefaults.standard
     private var pairingWizard: PairingWizard?
     private let header = MenuHeaderView()
+    private var activityWindow: ActivityLogWindow?
 
     /// Set when you unlock the Mac while the phone is out of range. Unlocking by
     /// hand is you saying "I am here, my phone is not" — so locking pauses until
@@ -31,6 +32,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// rather than a free-form field: the useful range is "almost immediately" to
     /// "I stepped out for a coffee", and nothing in between needs finer control.
     private static let lockDelays = [4, 10, 20, 30, 40, 50, 60, 120, 300]
+
+    /// How far above the lock threshold the signal must climb to call off a
+    /// pending lock, in dB. Offered as an offset rather than an absolute number
+    /// because it only means anything relative to the lock threshold: 0 removes
+    /// the hysteresis entirely and lets the signal flap across a single line.
+    private static let returnOffsets = [0, 2, 4, 5, 6, 8, 10]
+
+    private var returnOffset: Int {
+        get { prefs.object(forKey: "returnOffset") as? Int ?? 5 }
+        set {
+            prefs.set(newValue, forKey: "returnOffset")
+            applyThresholds()
+        }
+    }
+
+    private func returnTitle(_ offset: Int) -> String {
+        switch offset {
+        case 0:  return "\(lockRSSI) dBm — same as lock (no hysteresis)"
+        default: return "\(lockRSSI + offset) dBm — \(offset) dB above lock"
+        }
+    }
 
     /// The picker only offers devices this strong. Your phone is on the desk in
     /// front of you when you pair it, so anything further away is a neighbour's
@@ -75,7 +97,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.startPairing()
             }
         }
+
+        // After the saved device is restored, so the header does not report
+        // "paired_device=none" on every launch.
+        ActivityLog.shared.startSession(diagnosticHeader())
+        ActivityLog.shared.record(.ok, "launched", "Badgers BLE Lock started",
+            action: Locker.canLockDirectly
+                ? "Ready, using the system lock"
+                : "Ready, but the system lock is unavailable — will sleep the display instead",
+            fields: ["can_lock_directly": "\(Locker.canLockDirectly)"])
         refreshStatusItem()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ActivityLog.shared.record(.ok, "quit", "Badgers BLE Lock quit",
+                                  action: "Monitoring stopped")
+        ActivityLog.shared.flushPendingTail()
     }
 
     /// The screen unlock event is a distributed notification, no entitlement or
@@ -85,7 +122,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: NSNotification.Name("com.apple.screenIsUnlocked"),
             object: nil, queue: .main
         ) { [weak self] _ in
+            self?.monitor.systemSleeping = false
             self?.handleUnlock()
+        }
+        // The radio goes down as the machine sleeps, before the screen reports
+        // itself locked — so the lock state alone would call that a failure.
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(forName: NSWorkspace.willSleepNotification,
+                              object: nil, queue: .main) { [weak self] _ in
+            self?.monitor.systemSleeping = true
+        }
+        workspace.addObserver(forName: NSWorkspace.didWakeNotification,
+                              object: nil, queue: .main) { [weak self] _ in
+            self?.monitor.systemSleeping = false
         }
     }
 
@@ -93,15 +142,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard enabled, monitor.monitoredUUID != nil else { return }
         // Present already? Then this was an ordinary unlock and nothing changes.
         guard !monitor.present else { return }
-        NSLog("Unlocked with the phone away — pausing until it returns")
+        ActivityLog.shared.record(.warn, "suspended",
+            "You unlocked the Mac while the phone was out of range",
+            action: "Locking paused until the phone is back above \(monitor.presentRSSI) dBm",
+            fields: ["clears_at_rssi": "\(monitor.presentRSSI)",
+                     "last_rssi": monitor.smoothedRSSI.map { "\($0)" } ?? "none"])
         suspended = true
+    }
+
+    /// The settings and machine facts that decide everything else, gathered in
+    /// one place so the log file and a copied report say the same thing.
+    private func diagnosticHeader() -> [String: String] {
+        var h: [String: String] = [
+            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
+            "macos": ProcessInfo.processInfo.operatingSystemVersionString,
+            "enabled": "\(enabled)",
+            "suspended": "\(suspended)",
+            "lock_rssi_threshold": "\(lockRSSI)",
+            "return_rssi_threshold": "\(lockRSSI + returnOffset)",
+            "return_offset_db": "\(returnOffset)",
+            "smoothing_seconds": "\(Int(monitor.smoothingSeconds))",
+            "lock_delay_seconds": "\(lockDelay)",
+            "away_samples_required": "\(monitor.awaySamples)",
+            "away_seconds_required": "\(Int(monitor.awaySeconds))",
+            "warmup_seconds": "\(Int(monitor.warmupSeconds))",
+            "poll_interval_seconds": "\(monitor.pollInterval)",
+            "blip_grace_seconds": "\(Int(monitor.blipGrace))",
+            "signal_timeout_seconds": "\(Int(monitor.signalTimeout))",
+            "can_lock_directly": "\(Locker.canLockDirectly)",
+            "screen_locked_now": "\(Locker.isScreenLocked)",
+            "paired_device": monitor.monitoredUUID.map { deviceName(for: $0) } ?? "none",
+            "current_rssi": monitor.smoothedRSSI.map { "\($0)" } ?? "no signal",
+        ]
+        if #available(macOS 13.0, *) {
+            h["start_at_login"] = "\(SMAppService.mainApp.status == .enabled)"
+        }
+        return h
     }
 
     private func applyThresholds() {
         monitor.lockRSSI = lockRSSI
-        // 8 dB of hysteresis: you must come back meaningfully closer than the
-        // point at which you triggered a lock, otherwise it flaps at the boundary.
-        monitor.presentRSSI = lockRSSI + 8
+        // You must come back meaningfully closer than the point at which the
+        // countdown started, otherwise it flaps at the boundary.
+        monitor.presentRSSI = lockRSSI + returnOffset
         monitor.awayDelay = Double(lockDelay)
     }
 
@@ -143,6 +226,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         thresholdItem.submenu = thresholdMenu
         menu.addItem(thresholdItem)
 
+        let returnItem = NSMenuItem(title: "Return Threshold", action: nil, keyEquivalent: "")
+        let returnMenu = NSMenu()
+        for offset in Self.returnOffsets {
+            let item = NSMenuItem(title: returnTitle(offset),
+                                  action: #selector(selectReturnOffset(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = offset
+            returnMenu.addItem(item)
+        }
+        returnItem.submenu = returnMenu
+        menu.addItem(returnItem)
+
         let delayItem = NSMenuItem(title: "Lock Delay", action: nil, keyEquivalent: "")
         let delayMenu = NSMenu()
         for seconds in Self.lockDelays {
@@ -171,6 +266,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        let activity = NSMenuItem(title: "Activity Log…", action: #selector(showActivity),
+                                  keyEquivalent: "")
+        activity.target = self
+        menu.addItem(activity)
+
         let lockNow = NSMenuItem(title: "Lock Now", action: #selector(lockNow), keyEquivalent: "l")
         lockNow.target = self
         menu.addItem(lockNow)
@@ -195,8 +295,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.update(state)
     }
 
+    /// Names are remembered across launches. At startup the phone has not been
+    /// heard from yet, so the live table is empty and the menu and the
+    /// diagnostics header would otherwise show a raw UUID for the first minute.
     private func deviceName(for uuid: UUID) -> String {
-        monitor.discovered[uuid]?.name ?? uuid.uuidString
+        var cache = prefs.dictionary(forKey: "deviceNames") as? [String: String] ?? [:]
+        if let live = monitor.discovered[uuid]?.name, live != uuid.uuidString {
+            if cache[uuid.uuidString] != live {
+                cache[uuid.uuidString] = live
+                prefs.set(cache, forKey: "deviceNames")
+            }
+            return live
+        }
+        return cache[uuid.uuidString] ?? uuid.uuidString
     }
 
     // MARK: - Actions
@@ -225,6 +336,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lockRSSI = sender.tag
     }
 
+    @objc private func selectReturnOffset(_ sender: NSMenuItem) {
+        returnOffset = sender.tag
+    }
+
     @objc private func selectDelay(_ sender: NSMenuItem) {
         lockDelay = sender.tag
     }
@@ -249,7 +364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try service.register()
             }
         } catch {
-            NSLog("Could not change Start at Login: \(error.localizedDescription)")
+            ActivityLog.shared.record(.fail, "login_item_failed",
+                "Could not change Start at Login: \(error.localizedDescription)",
+                action: "Setting unchanged")
             let alert = NSAlert()
             alert.messageText = "Could not change Start at Login"
             // Overwhelmingly the cause is the app sitting somewhere transient:
@@ -266,8 +383,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func showActivity() {
+        if activityWindow == nil {
+            activityWindow = ActivityLogWindow(header: { [weak self] in
+                self?.diagnosticHeader() ?? [:]
+            })
+        }
+        activityWindow?.present()
+    }
+
     @objc private func lockNow() {
-        Locker.lock()
+        ActivityLog.shared.record(.ok, "lock_manual", "Lock Now chosen from the menu",
+                                  action: "Locking the screen")
+        attemptLock(reason: "manual")
     }
 }
 
@@ -315,6 +443,15 @@ extension AppDelegate: NSMenuDelegate {
         if let submenu = menu.item(withTitle: "Lock Threshold")?.submenu {
             for item in submenu.items { item.state = item.tag == lockRSSI ? .on : .off }
         }
+        // Titles are rebuilt on every open: they show absolute dBm, which moves
+        // whenever the lock threshold changes.
+        if let submenu = menu.item(withTitle: "Return Threshold")?.submenu {
+            for item in submenu.items {
+                item.title = returnTitle(item.tag)
+                item.state = item.tag == returnOffset ? .on : .off
+            }
+        }
+
         if let submenu = menu.item(withTitle: "Lock Delay")?.submenu {
             for item in submenu.items { item.state = item.tag == lockDelay ? .on : .off }
         }
@@ -337,19 +474,78 @@ extension AppDelegate: ProximityMonitorDelegate {
 
     func monitorDidUpdatePresence(_ present: Bool, reason: String) {
         if present && suspended {
-            NSLog("Phone back in range — resuming")
             suspended = false
+            ActivityLog.shared.record(.ok, "resumed",
+                "Phone returned while locking was paused",
+                action: "Locking re-armed")
         }
         refreshStatusItem()
-        guard !present, enabled, !suspended, monitor.monitoredUUID != nil else { return }
-        guard !Locker.isScreenLocked else { return }
-        NSLog("Locking screen (\(reason))")
-        Locker.lock()
+        guard !present else { return }
+
+        // Each condition reported separately. As one compound guard this
+        // returned silently, so "it just didn't lock" produced no evidence at
+        // all about which of four reasons was responsible.
+        if !enabled {
+            ActivityLog.shared.record(.warn, "lock_skipped",
+                "Phone is away, but monitoring is switched off",
+                action: "No lock", fields: ["reason": "disabled"])
+            return
+        }
+        if suspended {
+            ActivityLog.shared.record(.warn, "lock_skipped",
+                "Phone is away, but locking is paused because you unlocked while it was away",
+                action: "No lock until the phone returns",
+                fields: ["reason": "suspended",
+                         "clears_at_rssi": "\(monitor.presentRSSI)"])
+            return
+        }
+        if monitor.monitoredUUID == nil {
+            ActivityLog.shared.record(.warn, "lock_skipped", "No phone has been paired",
+                action: "No lock", fields: ["reason": "no_device"])
+            return
+        }
+        if Locker.isScreenLocked {
+            ActivityLog.shared.record(.ok, "lock_skipped", "Screen is already locked",
+                action: "Nothing to do", fields: ["reason": "already_locked"])
+            return
+        }
+
+        attemptLock(reason: reason)
+    }
+
+    /// Locking is attempted, verified, and reported — the previous code logged
+    /// "Locking screen" *before* the call and discarded its result, so a lock
+    /// that silently failed looked identical to one that worked.
+    private func attemptLock(reason: String) {
+        let direct = Locker.lock()
+        ActivityLog.shared.record(direct ? .ok : .warn, "lock_attempted",
+            "Phone away (\(reason)) — locking the screen",
+            action: direct ? "Called the system lock" : "System lock unavailable, slept the display instead",
+            fields: ["reason": reason, "method": direct ? "SACLockScreenImmediate" : "display_sleep"])
+
+        // Verify rather than assume. The display-sleep fallback only locks if
+        // "Require password immediately after sleep" is set, and that is a
+        // per-machine setting this app cannot see directly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if Locker.isScreenLocked {
+                ActivityLog.shared.record(.ok, "lock_confirmed", "Screen is locked",
+                                          action: "Done")
+            } else {
+                ActivityLog.shared.record(.fail, "lock_failed",
+                    "Screen did NOT lock two seconds after the attempt",
+                    action: "Machine is still unlocked",
+                    fields: ["method": direct ? "SACLockScreenImmediate" : "display_sleep",
+                             "fix": "System Settings > Lock Screen > Require password immediately after sleep"])
+            }
+        }
     }
 
     func monitorDidUpdatePending(_ pending: Bool) {
         refreshStatusItem()
     }
 
-    func monitorDidUpdateDeviceList() {}
+    func monitorDidUpdateDeviceList() {
+        // Side effect: caches the name for the next launch.
+        if let uuid = monitor.monitoredUUID { _ = deviceName(for: uuid) }
+    }
 }
