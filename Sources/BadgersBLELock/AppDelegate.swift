@@ -31,7 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Seconds of weak signal before locking. Offered as a menu of round numbers
     /// rather than a free-form field: the useful range is "almost immediately" to
     /// "I stepped out for a coffee", and nothing in between needs finer control.
-    private static let lockDelays = [4, 10, 20, 30, 40, 50, 60, 120, 300]
+    private static let lockDelays = [4, 7, 10, 20, 30, 40, 50, 60, 120, 300]
 
     /// How far above the lock threshold the signal must climb to call off a
     /// pending lock, in dB. Offered as an offset rather than an absolute number

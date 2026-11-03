@@ -127,11 +127,17 @@ final class PairingWizard: NSWindowController {
         case .intro:
             headline.stringValue = "Step 1 — Bluetooth on"
             instruction.stringValue = """
-                Make sure Bluetooth is ON on your iPhone and that the phone is \
-                already paired with this Mac, then bring it near the keyboard.
+                Make sure Bluetooth is ON on your iPhone, and bring it near the keyboard.
 
-                Pairing matters: an unpaired iPhone changes its Bluetooth identity \
-                every few minutes, so it can't be tracked reliably.
+                If your phone is not already listed by name below, connect this Mac \
+                to the phone's Personal Hotspot once (Wi-Fi menu › your iPhone). \
+                That is what makes the Mac recognise it. Trying to pair the phone \
+                under Settings › Bluetooth does not work — iOS does not offer a Mac \
+                there.
+
+                This matters beyond the name: a phone the Mac cannot recognise \
+                changes its Bluetooth identity every few minutes, so it cannot be \
+                tracked reliably.
                 """
             primaryButton.title = "Start Listening"
         case .turnOff:
